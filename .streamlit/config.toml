@@ -1,0 +1,7 @@
+# https://docs.streamlit.io/develop/concepts/configuration
+[browser]
+gatherUsageStats = false
+
+[server]
+headless = true
+port = 8511

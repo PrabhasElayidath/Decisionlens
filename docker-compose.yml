@@ -1,0 +1,25 @@
+version: "3.8"
+
+services:
+  api:
+    build: .
+    container_name: decisionlens-api
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./models:/app/models
+    environment:
+      - PYTHONPATH=/app
+      
+  ui:
+    build: .
+    container_name: decisionlens-ui
+    command: streamlit run run_streamlit.py --server.port 8511 --server.address 0.0.0.0
+    ports:
+      - "8511:8511"
+    environment:
+      - API_URL=http://api:8000
+      - PYTHONPATH=/app
+    depends_on:
+      - api

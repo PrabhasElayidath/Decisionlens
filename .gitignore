@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+*.xls
+*.xlsx
+data/raw/
+models/*.json
+models/*.npy
+models/*.joblib
+logs/*.log
+.pytest_cache/
+.idea/
+.vscode/
