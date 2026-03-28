@@ -1,17 +1,21 @@
 """
-DecisionLens dashboard: prediction, SHAP explanations, global importance, what-if.
-Requires the FastAPI backend (see README) or set API_URL.
+DecisionLens dashboard — standalone version (no separate API needed).
+Calls ModelService and ExplainService directly for HF Spaces / single-process deployment.
 """
 
 from __future__ import annotations
 
 import html
-import os
+import sys
 from pathlib import Path
 
-import httpx
 import plotly.graph_objects as go
 import streamlit as st
+
+# ── Path setup so utils/ and services/ resolve correctly ──────────────────────
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 STYLE_PATH = Path(__file__).resolve().parent / "style.css"
 
@@ -25,26 +29,38 @@ st.set_page_config(
 if STYLE_PATH.exists():
     st.markdown(f"<style>{STYLE_PATH.read_text(encoding='utf-8')}</style>", unsafe_allow_html=True)
 
-API_URL = os.getenv("API_URL", "http://127.0.0.1:8000").rstrip("/")
 
-# —— Sidebar (minimal, premium) ——
+# ── Load services once (cached) ───────────────────────────────────────────────
+@st.cache_resource(show_spinner="Loading model...")
+def load_services():
+    from services.model import ModelService
+    from services.explain import ExplainService
+    model_svc = ModelService()
+    explain_svc = ExplainService(model_svc)
+    return model_svc, explain_svc
+
+
+try:
+    model_service, explain_service = load_services()
+except FileNotFoundError:
+    st.error(
+        "Model artifacts not found. Please run `python data/train.py` first "
+        "to generate `models/xgb_model.json` and `models/metadata.json`."
+    )
+    st.stop()
+
+
+# ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### ◈ Control")
-    st.caption("Backend connection")
-    st.code(API_URL, language="text")
-    if st.button("Ping API", use_container_width=True):
-        try:
-            r = httpx.get(f"{API_URL}/health", timeout=10.0)
-            if r.status_code == 200:
-                h = r.json()
-                st.success("Online")
-                st.caption(f"Data: `{h.get('data_source', '—')}`")
-            else:
-                st.error(r.text[:200])
-        except Exception as e:
-            st.error(str(e))
+    st.caption("Model info")
+    meta = model_service.meta
+    st.code(f"Model: {meta.get('model_type', 'xgboost')}\nData: {meta.get('data_source', '—')}", language="text")
+    metrics = meta.get("metrics", {})
+    roc = metrics.get("roc_auc", "—")
+    st.caption(f"ROC-AUC: {roc if isinstance(roc, str) else f'{roc:.3f}'}")
     st.divider()
-    st.caption("DecisionLens · XGBoost + SHAP · Production-style API")
+    st.caption("DecisionLens · XGBoost + SHAP · Standalone")
 
 
 def _payload(age, income, credit, loan, emp, dti) -> dict:
@@ -123,7 +139,7 @@ def _global_bar_figure(ranked: list[dict]) -> go.Figure:
     return fig
 
 
-# —— Hero ——
+# ── Hero ──────────────────────────────────────────────────────────────────────
 st.markdown(
     """
 <div class="hero-wrap">
@@ -181,34 +197,25 @@ scenario = _payload(s_age, s_income, s_credit, s_loan, s_emp, s_dti)
 st.markdown('<p class="section-label">Live intelligence</p>', unsafe_allow_html=True)
 
 try:
-    with httpx.Client(timeout=30.0) as client:
-        pred = client.post(f"{API_URL}/predict", json=baseline)
-        expl = client.post(f"{API_URL}/explain", json=baseline)
-        wif = client.post(f"{API_URL}/what-if", json={"baseline": baseline, "scenario": scenario})
+    # ── Direct service calls (no HTTP) ────────────────────────────────────────
+    p = model_service.predict(baseline)
+    e_local = explain_service.generate_local_explanation(baseline)
+    e_global = explain_service.generate_global_importance()
+    loc = e_local
 
-    if pred.status_code != 200:
-        st.error(f"/predict failed ({pred.status_code}): {pred.text}")
-        st.stop()
-    if expl.status_code != 200:
-        st.error(f"/explain failed ({expl.status_code}): {expl.text}")
-        st.stop()
-    if wif.status_code != 200:
-        st.error(f"/what-if failed ({wif.status_code}): {wif.text}")
-        st.stop()
+    # What-if
+    b_prob = model_service.predict_proba_positive(baseline)
+    s_prob = model_service.predict_proba_positive(scenario)
+    s_out = model_service.predict(scenario)
+    delta = float(s_prob - b_prob)
+    if delta > 0.02:
+        interpretation = f"Scenario increases estimated risk by {delta * 100:.1f} percentage points versus baseline."
+    elif delta < -0.02:
+        interpretation = f"Scenario decreases estimated risk by {abs(delta) * 100:.1f} percentage points versus baseline."
+    else:
+        interpretation = "Scenario is close to baseline; estimated risk barely moves."
 
-    p = pred.json()
-    e = expl.json()
-    w = wif.json()
-    loc = e["local_explanation"]
-
-    try:
-        health = httpx.get(f"{API_URL}/health", timeout=5.0).json()
-    except Exception:
-        health = {}
-
-    metrics = health.get("holdout_metrics") or {}
     roc = metrics.get("roc_auc", "—")
-
     st.markdown(
         f"""
 <div class="kpi-row">
@@ -245,9 +252,9 @@ try:
   <p class="panel-title">Counterfactual delta</p>
   <p class="panel-head">Scenario vs baseline</p>
   <p style="color:#64748b;font-size:0.72rem;text-transform:uppercase;letter-spacing:0.12em;margin:0;">Scenario P(risk)</p>
-  <p class="metric-big">{w["scenario"]["probability"] * 100:.2f}%</p>
-  <p class="metric-delta">{w["delta_probability"] * 100:+.2f} pts vs baseline</p>
-  <p class="metric-caption">{html.escape(w["interpretation"])}</p>
+  <p class="metric-big">{s_prob * 100:.2f}%</p>
+  <p class="metric-delta">{delta * 100:+.2f} pts vs baseline</p>
+  <p class="metric-caption">{html.escape(interpretation)}</p>
 </div>
 """,
             unsafe_allow_html=True,
@@ -261,7 +268,7 @@ try:
         )
 
     with right:
-        glob = e["global_importance"]["ranked"]
+        glob = e_global["ranked"]
         st.plotly_chart(
             _global_bar_figure(glob),
             use_container_width=True,
@@ -325,9 +332,5 @@ try:
         unsafe_allow_html=True,
     )
 
-except httpx.ConnectError:
-    st.error(
-        "Cannot reach the API. In another terminal run:  \n`$env:PYTHONPATH='E:\\ml'; .\\.venv\\Scripts\\Activate.ps1; python -m uvicorn api.main:app --host 127.0.0.1 --port 8000`"
-    )
 except Exception as ex:
     st.exception(ex)
